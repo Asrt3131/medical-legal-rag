@@ -11,7 +11,7 @@ import faiss
 import numpy as np
 
 from rag import build_index, search, get_model
-from llm import generate_answer
+from llm import generate_answer, is_llm_available
 from config import TOP_K, CHUNK_SIZE
 
 # ============================================================
@@ -25,7 +25,7 @@ st.set_page_config(
 )
 
 # ============================================================
-# Styles (scoped RTL only where needed)
+# Styles
 # ============================================================
 st.markdown(
     """
@@ -64,7 +64,7 @@ st.markdown(
 DOMAINS = {
     "🏥 Medical": {
         "system": (
-            "You are a medical documents assistant. Answer in Persian, "
+            "You are a medical documents assistant. Answer in English, "
             "cite page numbers, and add a disclaimer that this is not medical advice."
         ),
         "emoji": "🏥",
@@ -72,7 +72,7 @@ DOMAINS = {
     },
     "⚖️ Legal": {
         "system": (
-            "You are a legal documents assistant. Answer in Persian, "
+            "You are a legal documents assistant. Answer in English, "
             "cite articles/pages, and add a disclaimer that this is not legal advice."
         ),
         "emoji": "⚖️",
@@ -87,9 +87,9 @@ def init_state():
     defaults = {
         "index": None,
         "chunks": [],
-        "files_meta": [],      # list of {"name", "chunks", "pages", "hash", "size"}
+        "files_meta": [],
         "messages": [],
-        "indexed_files": set(),  # set of "name|size|hash" keys
+        "indexed_files": set(),
         "model_loaded": False,
     }
     for k, v in defaults.items():
@@ -97,6 +97,8 @@ def init_state():
 
 
 init_state()
+
+LLM_AVAILABLE = is_llm_available()
 
 
 # ============================================================
@@ -128,12 +130,13 @@ def rebuild_index():
     for meta in st.session_state.files_meta:
         data = st.session_state.get("_file_bytes", {}).get(meta["hash"])
         if data is None:
-            continue  # file no longer available
+            continue
+        tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp.write(data)
                 tmp_path = tmp.name
-            idx, chunks = build_index(tmp_path)
+            idx, chunks = build_index(tmp_path, file_name=meta["name"])
             if idx is not None and chunks:
                 all_vectors.append(idx.reconstruct_n(0, idx.ntotal))
                 all_chunks.extend(chunks)
@@ -141,7 +144,7 @@ def rebuild_index():
         except Exception as e:
             st.warning(f"Could not re-index {meta['name']}: {e}")
         finally:
-            if "tmp_path" in locals() and os.path.exists(tmp_path):
+            if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
 
     if all_vectors:
@@ -184,6 +187,12 @@ def render_sources(sources, with_latency=False, latency=None):
 with st.sidebar:
     st.title("🩺📄 MediLegal RAG Pro")
 
+    # --- LLM status ---
+    if LLM_AVAILABLE:
+        st.success("✅ LLM ready")
+    else:
+        st.warning("⚠️ API key not set — document browsing only")
+
     # --- Upload ---
     st.header("📂 Documents")
     uploaded = st.file_uploader(
@@ -194,7 +203,6 @@ with st.sidebar:
     )
 
     if uploaded:
-        # Persist raw bytes so we can rebuild the index later
         st.session_state.setdefault("_file_bytes", {})
         for f in uploaded:
             key = file_key(f)
@@ -227,7 +235,7 @@ with st.sidebar:
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                         tmp.write(f.getvalue())
                         tmp_path = tmp.name
-                    idx, chunks = build_index(tmp_path)
+                    idx, chunks = build_index(tmp_path, file_name=f.name)
                     if idx is None or not chunks:
                         raise ValueError("No text could be extracted from the PDF")
                     new_pairs.append((idx, chunks))
@@ -245,12 +253,9 @@ with st.sidebar:
                     if tmp_path and os.path.exists(tmp_path):
                         os.unlink(tmp_path)
 
-            # Merge with existing index
             if new_pairs:
                 if st.session_state.index is not None and st.session_state.chunks:
-                    # Rebuild-merge: simplest correct approach
                     existing_meta = st.session_state.files_meta
-                    existing_bytes = st.session_state.get("_file_bytes", {})
                     st.session_state.files_meta = existing_meta + new_meta
                     rebuild_index()
                 else:
@@ -356,7 +361,7 @@ st.caption(
 )
 
 # --- Render chat history ---
-for i, m in enumerate(st.session_state.messages):
+for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
         if m["role"] == "assistant" and m.get("sources"):
@@ -378,6 +383,13 @@ if q_raw is not None:
 
     if st.session_state.index is None:
         st.warning("⚠️ First upload and index a document.")
+        st.stop()
+
+    if not LLM_AVAILABLE:
+        st.warning(
+            "⚠️ LLM is not configured. Set OPENAI_API_KEY in Streamlit Secrets "
+            "to enable question answering."
+        )
         st.stop()
 
     st.session_state.messages.append({"role": "user", "content": q})
